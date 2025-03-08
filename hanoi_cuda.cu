@@ -12,26 +12,37 @@
     } \
 }
 
-// 使用常量内存存储频繁访问的只读参数
-__constant__ int const_n;
-__constant__ int const_direction;
+// 修改关键点：使用更明确的常量内存声明方式
+__device__ __constant__ int cuda_n;
+__device__ __constant__ int cuda_direction;
 
 __global__ void hanoi_kernel(int *d_steps, long long base, long long chunk_steps) {
     long long idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= chunk_steps) return;
 
     long long m = base + idx + 1;
+    
+    // 使用内建函数 __ffsll 查找最低位 1 的位置
     int disk = __ffsll(m) - 1;
-    int from = (disk % 2) ? 1 : 0;
     
-    // 使用预计算的const_direction替代实时计算
-    int to = (from + const_direction * ((m >> (disk + 1)) % 2 ? 1 : 2)) % 3;
+    // 优化：避免使用模运算，改用位运算判断奇偶性
+    int from = (disk & 1) ? 1 : 0;
+    
+    // 从常量内存读取值并预计算奇偶性
+    int n_mod2 = cuda_n & 1;
+    int direction = cuda_direction;
+    
+    // 优化：使用位运算获取移位后的特定位
+    int shift_bit = (m >> (disk + 1)) & 1;
+    int offset = shift_bit ? 1 : 2;
+    
+    // 使用预计算的 direction 替代实时计算
+    int to = (from + direction * offset) % 3;
     from %= 3;
-    to %= 3;
     
-    // 使用预计算的const_n替代实时计算
-    from = (from + (const_n % 2)) % 3;
-    to = (to + (const_n % 2)) % 3;
+    // 使用预计算的 n_mod2
+    from = (from + n_mod2) % 3;
+    to = (to + n_mod2) % 3;
     
     d_steps[idx] = (from << 4) | to;
 }
@@ -61,27 +72,41 @@ double get_time() {
 
 void solve_hanoi(int n) {
     long long total_steps = (1LL << n) - 1;
-    const double start_time = get_time(); // 记录总开始时间
+    const double start_time = get_time(); // 记录总体开始时间
     
     // 提前声明所有可能被跳过的变量
     float milliseconds = 0;  // 初始化为默认值
     double elapsed_sec = 0;
     double est_total = 0;
     double remaining_sec = 0;
-    
-    if (n > 40) {
-        fprintf(stderr, "Error: Maximum supported layers is 40\n");
-        exit(1);
-    }
 
-    // 预计算常量并拷贝到常量内存
+    // 预计算常量并分别拷贝到常量内存
+    int host_n = n;
     int host_direction = (n % 2) ? -1 : 1;
-    CHECK_CUDA(cudaMemcpyToSymbol(const_n, &n, sizeof(int)));
-    CHECK_CUDA(cudaMemcpyToSymbol(const_direction, &host_direction, sizeof(int)));
+    CHECK_CUDA(cudaMemcpyToSymbol(cuda_n, &host_n, sizeof(int)));
+    CHECK_CUDA(cudaMemcpyToSymbol(cuda_direction, &host_direction, sizeof(int)));
 
-    // 复用显存指针（保留static优化）
+    // 复用显存指针（保留 static 优化）
     static int *d_steps = nullptr;
     static size_t allocated_size = 0;
+
+    // 获取 GPU 设备属性以优化线程配置
+    int deviceId;
+    cudaDeviceProp props;
+    CHECK_CUDA(cudaGetDevice(&deviceId));
+    CHECK_CUDA(cudaGetDeviceProperties(&props, deviceId));
+    
+    // 根据计算能力选择最佳线程数
+    int threads;
+    if (props.major >= 9) {          // Hopper 及更新架构
+        threads = 512;
+    } else if (props.major >= 8) {   // Ampere 架构
+        threads = 384;
+    } else if (props.major >= 7) {   // Volta/Turing 架构
+        threads = 384;
+    } else {                         // Pascal 及更早架构
+        threads = 256;
+    }
 
     // 使用异步流进行内存操作
     cudaStream_t stream;
@@ -93,7 +118,7 @@ void solve_hanoi(int n) {
     
     CHECK_CUDA(cudaEventRecord(start));
     
-    // 初始化颜色支持（Windows需要启用VT支持）
+    // 初始化颜色支持（Windows 需要启用 VT 支持）
     #ifdef _WIN32
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD mode = 0;
@@ -104,30 +129,29 @@ void solve_hanoi(int n) {
     for (long long base = 0; base < total_steps; ) {
         size_t free_mem, total_mem;
         
-        // 减少显存查询频率（每10次循环查询一次）
+        // 减少显存查询频率（每 10 次循环查询一次）
         if (base % 10 == 0) {
             CHECK_CUDA(cudaMemGetInfo(&free_mem, &total_mem));
         }
         
-        // 使用更激进的内存分配策略（保留512MB安全边界）
+        // 使用更激进的内存分配策略（保留 512MB 安全边界）
         const size_t safety_margin = 512LL << 20;
         size_t available_mem = (free_mem > safety_margin) ? (free_mem - safety_margin) : 0;
         
         if (available_mem < sizeof(int)) {
             fprintf(stderr, "Insufficient GPU memory: Free %.2fGB < 512MB required\n", 
-                   free_mem/1024.0/1024/1024);
+                   free_mem / 1024.0 / 1024 / 1024);
             goto cleanup;
         }
         
-        // 计算最优块大小（调整为256线程/块）
-        const int threads = 256;
+        // 计算最优块大小（使用动态调整的线程数）
         long long max_chunk_steps = available_mem / sizeof(int);
         long long remaining_steps = total_steps - base;
         long long chunk_steps = std::min(max_chunk_steps, remaining_steps);
         
-        // 动态调整块大小（最小1M，最大1G）
-        chunk_steps = std::min(chunk_steps, 1LL << 30);  // 上限1G
-        chunk_steps = std::max(chunk_steps, 1LL << 20);  // 下限1M
+        // 动态调整块大小（最小 1M，最大 1G）
+        chunk_steps = std::min(chunk_steps, 1LL << 30);  // 上限 1G
+        chunk_steps = std::max(chunk_steps, 1LL << 20);  // 下限 1M
 
         // 自适应更新频率
         long long update_interval = std::max(total_steps / 1000, 1LL << 20);
@@ -140,7 +164,7 @@ void solve_hanoi(int n) {
             allocated_size = chunk_steps;
         }
         
-        // 使用异步内核启动
+        // 使用异步内核启动，应用优化的线程数
         dim3 blocks((chunk_steps + threads - 1) / threads);
         hanoi_kernel<<<blocks, threads, 0, stream>>>(d_steps, base, chunk_steps);
         
@@ -172,13 +196,13 @@ void solve_hanoi(int n) {
     CHECK_CUDA(cudaEventElapsedTime(&milliseconds, start, stop));
 
 cleanup:
-    // 现在可以安全访问所有变量
+    // 打印纯 GPU 计算时间
     if (milliseconds > 0) {
         printf("\x1b[32mPure GPU compute time: %.2f ms\x1b[0m\n", milliseconds);
     }
     
     // 显存释放策略：小规模计算立即释放，大规模计算保留复用
-    if (d_steps && n < 30) {  // 30层以下立即释放
+    if (d_steps && n < 30) {  // 30 层以下立即释放
         CHECK_CUDA(cudaFree(d_steps));
         d_steps = nullptr;
         allocated_size = 0;
